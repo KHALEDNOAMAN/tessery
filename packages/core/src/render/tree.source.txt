@@ -42,6 +42,8 @@ export interface TreeProps {
   query?: Record<string, string | string[] | undefined>
   /** Hand-written components for custom elements, by component id. */
   custom?: Record<string, (p: any) => any>
+  /** Renders the page while its data loads: record frames and data blocks show placeholders. */
+  loading?: boolean
 }
 type Ctx = Required<Omit<TreeProps, 'root' | 'theme' | 'icon' | 'path' | 'query' | 'custom'>> & Pick<TreeProps, 'icon' | 'path' | 'query' | 'custom'> & { logo?: string }
 type Row = Record<string, unknown>
@@ -184,6 +186,41 @@ export function records(data: unknown): Row[] {
 
 const human = (k: string) => k.split('.').pop()!.replace(/[_-]+/g, ' ').replace(/([a-z])([A-Z])/g, '$1 $2').replace(/^\w/, (c) => c.toUpperCase())
 /** In the editor a record frame has no data yet, so each field shows its own name. */
+/** What a page loads in place of data when the request fails, so the page can say so instead of showing an empty list. */
+export const FAILED = { tesseryFailed: true } as const
+
+type DataState = 'data' | 'loading' | 'empty' | 'error'
+
+/** Which state a record frame or data block shows: the editor previews the one picked in the inspector. */
+function dataState(e: El, t: Ctx): DataState {
+  const pick = e.props?.previewState
+  if (t.editing) return pick === 'loading' || pick === 'empty' || pick === 'error' ? pick : 'data'
+  if (t.loading) return 'loading'
+  const v = t.data[e.id] as Row | undefined
+  return v && typeof v === 'object' && v.tesseryFailed === true ? 'error' : 'data'
+}
+
+/** The page's own address with its query, which reloads it with the same filters. */
+function here(t: Ctx): string {
+  const q = new URLSearchParams()
+  for (const [k, v] of Object.entries(t.query ?? {})) for (const x of Array.isArray(v) ? v : v === undefined ? [] : [v]) q.append(k, x)
+  const s = q.toString()
+  return `${t.path ?? ''}${s ? `?${s}` : ''}` || '?'
+}
+
+function Skeleton({ rows }: { rows: number }) {
+  return <>{Array.from({ length: rows }, (_, i) => <div key={i} className="tsp-skeleton" aria-hidden="true"><span /><span /></div>)}</>
+}
+
+function Failed({ p, t }: { p: Record<string, unknown>; t: Ctx }) {
+  return (
+    <div className="tsp-failed" role="alert">
+      <p>{String(p.error ?? 'This could not be loaded.')}</p>
+      <a className="tsp-retry" href={t.editing ? undefined : here(t)}>{String(p.retry ?? 'Try again')}</a>
+    </div>
+  )
+}
+
 const SAMPLE: Row = new Proxy({}, { get: (_t, k) => (typeof k === 'string' ? human(k) : undefined) })
 
 function lookup(row: Row, path: string): unknown {
@@ -255,11 +292,15 @@ function Node({ e, t, row, copy, scope }: { e: El; t: Ctx; row?: Row; copy?: boo
     case 'frame': {
       const tag = FRAME_TAGS.has(String(p.tag)) ? String(p.tag) : 'div'
       let body: any = kids(row, copy)
+      const state = 'source' in p ? dataState(e, t) : 'data'
       if ('source' in p) {
-        const loaded = t.data[e.id]
+        const loaded = state === 'empty' ? [] : t.data[e.id]
         const list = loaded === undefined && t.editing ? Array.from({ length: Math.max(1, Number(p.preview) || 3) }, () => SAMPLE) : records(loaded)
         const shown = list.slice(0, Number(p.limit) || 50)
-        body = shown.length
+        if (state === 'loading') base['aria-busy'] = 'true'
+        body = state === 'loading' ? <Skeleton rows={Math.min(Math.max(1, Number(p.preview) || 3), 6)} />
+          : state === 'error' ? <Failed p={p} t={t} />
+          : shown.length
           ? shown.map((r, i) => {
             const ids = new Set<string>()
             e.children?.forEach((x) => walkIds(x, ids))
@@ -271,6 +312,8 @@ function Node({ e, t, row, copy, scope }: { e: El; t: Ctx; row?: Row; copy?: boo
       if (p.popover && !t.editing) { base.id = popId(e.id, scope); base.popover = 'auto' }
       if (p.popover && t.editing) base['data-popover'] = ''
       if (tag === 'details' && (t.editing || p.open)) base.open = true
+      // On the loading screen, actions are not resolved yet, so a form that posts to one waits for the page.
+      if (t.loading && p.action) body = <fieldset className="tsp-wait" disabled>{body}</fieldset>
       if (tag === 'form') {
         const act = p.action ? (t.actions[e.id] as { service?: string; method?: string; path?: string; params?: Record<string, string> } | undefined) : undefined
         if (act?.service && act.path && act.method) {
@@ -287,7 +330,8 @@ function Node({ e, t, row, copy, scope }: { e: El; t: Ctx; row?: Row; copy?: boo
         return <form {...base} action={action} method="get" role={p.role === 'search' ? 'search' : undefined}>{body}</form>
       }
       const href = link(p.href)
-      if (href && tag !== 'summary') return <a {...base} href={href}>{body}</a>
+      // A failed frame holds a retry link, and links cannot nest.
+      if (href && tag !== 'summary' && state !== 'error') return <a {...base} href={href}>{body}</a>
       const Tag = tag as any
       return <Tag {...base}>{body}</Tag>
     }
@@ -355,10 +399,16 @@ function Node({ e, t, row, copy, scope }: { e: El; t: Ctx; row?: Row; copy?: boo
     case 'block': {
       const Block = t.blocks[String(p.block)]
       if (!Block) return <div {...base} />
+      const state = 'source' in p ? dataState(e, t) : 'data'
+      // Blocks lay out their own page gutter, so a state shown in place of one gets the same gutter.
+      if (state === 'loading') return <div {...base} aria-busy="true"><div className="tsp-block-state"><Skeleton rows={3} /></div></div>
+      if (state === 'error') return <div {...base}><div className="tsp-block-state"><Failed p={p} t={t} /></div></div>
       const props: Record<string, unknown> = {}
-      for (const [k, v] of Object.entries({ ...(t.defaults[String(p.block)] ?? {}), ...p })) if (k !== 'block' && k !== 'source' && k !== 'action') props[k] = asset(v, t.assetBase)
-      if (e.id in t.data) props.data = t.data[e.id]
+      for (const [k, v] of Object.entries({ ...(t.defaults[String(p.block)] ?? {}), ...p })) if (!BLOCK_OWN.has(k)) props[k] = asset(v, t.assetBase)
+      if (state === 'empty') props.data = []
+      else if (e.id in t.data) props.data = t.data[e.id]
       if (e.id in t.actions) props.action = t.actions[e.id]
+      if (t.loading && p.action) return <div {...base}><fieldset className="tsp-wait" disabled><Block {...props} /></fieldset></div>
       return <div {...base}><Block {...props} /></div>
     }
     default:
@@ -366,11 +416,14 @@ function Node({ e, t, row, copy, scope }: { e: El; t: Ctx; row?: Row; copy?: boo
   }
 }
 
-export function Tree({ root, theme, blocks, defaults = {}, data = {}, actions = {}, assetBase = '/assets/', icon, path, editing = false, query, custom }: TreeProps) {
+/** Element props the tree handles itself rather than passing to a block. */
+const BLOCK_OWN = new Set(['block', 'source', 'action', 'error', 'retry', 'previewState'])
+
+export function Tree({ root, theme, blocks, defaults = {}, data = {}, actions = {}, assetBase = '/assets/', icon, path, editing = false, query, custom, loading = false }: TreeProps) {
   return (
     <div className="tsp tsp-tree">
       <style>{treeCss(root, theme, assetBase)}</style>
-      <Node e={root} t={{ blocks, defaults, data, actions, assetBase, icon, path, editing, query, custom, logo: theme.logo }} />
+      <Node e={root} t={{ blocks, defaults, data, actions, assetBase, icon, path, editing, query, custom, loading, logo: theme.logo }} />
     </div>
   )
 }
